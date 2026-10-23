@@ -141,8 +141,8 @@ def export(ply_file,
 
     #semantic_seg = np.ones((points.shape[0],), dtype=np.int64)
     #treeID = np.zeros((points.shape[0],), dtype=np.int64)
-    semantic_seg = pcd["semantic_seg"].astype(np.int64)
-    treeID = pcd["treeID"].astype(np.int64)
+    semantic_seg = pcd["semantic_seg"].astype(np.int64) if "semantic_seg" in pcd else np.ones((points.shape[0],), dtype=np.int64)
+    treeID = pcd["treeID"].astype(np.int64) if "treeID" in pcd else np.zeros((points.shape[0],), dtype=np.int64)
     #semantic_seg = pcd["semantic"].astype(np.int64)
     #treeID = pcd["instance"].astype(np.int64)
 

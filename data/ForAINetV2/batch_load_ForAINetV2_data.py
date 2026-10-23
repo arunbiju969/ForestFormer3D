@@ -16,7 +16,7 @@ from os import path as osp
 import importlib
 
 import torch
-import segmentator
+# import segmentator
 import open3d as o3d
 import numpy as np
 from load_forainetv2_data import export

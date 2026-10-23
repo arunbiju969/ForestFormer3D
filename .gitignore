@@ -1,3 +1,37 @@
-# Ignore Python bytecode
-*.pyc
+# Python bytecode & cache
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+ENV/
+
+# Model weights and checkpoints (exceeds GitHub 100 MB limit)
+work_dirs/
+*.pth
+*.pt
+*.bin
+*.ckpt
+
+# Local dependencies & builds
+mmdetection3d/
+build/
+dist/
+*.egg-info/
+
+# Data and Point Clouds
+*.las
+*.laz
+*.ply
+*.pcd
+*.h5
+*.npy
+*.npz
+
+# Logs and IDE
+*.log
+temp/
+tmp/
+.vscode/
+.idea/

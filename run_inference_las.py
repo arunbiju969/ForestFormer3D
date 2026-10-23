@@ -1,0 +1,607 @@
+"""
+ForestFormer3D Native Windows LAS/LAZ Direct Inference Pipeline
+==============================================================
+Runs 3D Forest LiDAR tree instance segmentation directly on raw or normalized
+LAS/LAZ files using the official ICCV 2025 ForestFormer3D pretrained model.
+
+Supports:
+  1. Direct file inference (plots / individual scans)
+  2. Bounding box ROI cropping (--roi xmin ymin xmax ymax)
+  3. Plot center cropping (--plot-center X Y --plot-size W H)
+  4. Tiled batch processing for entire large tracts (--tile-all --tile-size 70 --tile-overlap 10)
+  5. Outputs standard georeferenced LAS with 'tree_id', 'tree_score', 'semantic_pred', 'itc'
+     plus standard ASPRS classification (2=ground, 4=wood/stem, 5=foliage).
+  6. Preserves semantic_pred directly for TreeAIBox Enhancer.
+"""
+
+import os
+import sys
+import time
+import json
+import argparse
+import tempfile
+import numpy as np
+import torch
+import laspy
+from plyfile import PlyData, PlyElement
+
+# Ensure ForestFormer3D repository is on path
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from mmengine.config import Config
+from mmengine.runner.checkpoint import load_checkpoint
+from mmdet3d.registry import MODELS
+from mmdet3d.utils import register_all_modules
+from mmdet3d.structures import Det3DDataSample
+import oneformer3d  # Register OneFormer3D custom modules
+
+
+def build_pipeline_model(config_path, checkpoint_path, device, radius=16.0, step_size=6.0, score_th=0.4, chunk=20000):
+    register_all_modules()
+    
+    cfg = Config.fromfile(config_path)
+    
+    # Configure model runtime parameters
+    cfg.model.radius = float(radius)
+    cfg.model.score_th = float(score_th)
+    cfg.model.chunk = int(chunk)
+    
+    # Direct temporary output directory for model's intermediate ply export
+    temp_work_dir = tempfile.mkdtemp(prefix="ff3d_tmp_")
+    if cfg.model.get('test_cfg') is None:
+        from mmengine.config import ConfigDict
+        cfg.model.test_cfg = ConfigDict()
+    cfg.model.test_cfg['output_dir'] = temp_work_dir
+    
+    print(f"[Model] Building ForAINetV2OneFormer3D_XAwarequery...")
+    model = MODELS.build(cfg.model)
+    model.step_size = float(step_size)
+    
+    print(f"[Model] Loading weights from {checkpoint_path}...")
+    load_checkpoint(model, checkpoint_path, map_location='cpu')
+    
+    print(f"[Model] Moving to {device}...")
+    model = model.to(device)
+    model.step_size = float(step_size)
+    model.eval()
+    
+    return model, temp_work_dir
+
+
+def run_cylinder_inference(model, points_xyz, temp_work_dir, device, scan_name="roi_scan"):
+    """
+    Runs cylindrical 3D tree instance segmentation on an (N, 3) float64 array of coordinates.
+    Returns:
+        semantic_pred: (N,) int array (0=ground, 1=wood/stem, 2=foliage)
+        instance_pred: (N,) int array (-1=ground, 0..K-1=tree instances)
+        instance_scores: (N,) float array
+    """
+    N = points_xyz.shape[0]
+    
+    # 1. Normalization: center XY at 0, align Z min at 0
+    mean_x = float(np.mean(points_xyz[:, 0]))
+    mean_y = float(np.mean(points_xyz[:, 1]))
+    min_z = float(np.min(points_xyz[:, 2]))
+    
+    pts_norm = points_xyz.copy()
+    pts_norm[:, 0] -= mean_x
+    pts_norm[:, 1] -= mean_y
+    pts_norm[:, 2] -= min_z
+    
+    pts_tensor = torch.from_numpy(pts_norm.astype(np.float32)).to(device)
+    
+    # 2. Package sample
+    sample = Det3DDataSample()
+    safe_name = f"test_{scan_name}.ply"
+    sample.lidar_path = safe_name
+    sample.eval_ann_info = {
+        'pts_semantic_mask': np.zeros(N, dtype=np.int64),
+        'pts_instance_mask': np.zeros(N, dtype=np.int64)
+    }
+    
+    # 3. Predict
+    t0 = time.time()
+    with torch.no_grad():
+        model.predict({'points': [pts_tensor]}, [sample])
+    infer_time = time.time() - t0
+    
+    # 4. Read back the generated PLY file from temp_work_dir
+    ply_out_path = os.path.join(temp_work_dir, safe_name)
+    if not os.path.isfile(ply_out_path):
+        raise FileNotFoundError(f"Expected model prediction file not found at {ply_out_path}")
+        
+    ply_data = PlyData.read(ply_out_path)
+    vertex_data = ply_data.elements[0].data
+    
+    semantic_pred = np.array(vertex_data['semantic_pred'], dtype=np.int32)
+    instance_pred = np.array(vertex_data['instance_pred'], dtype=np.int32)
+    instance_scores = np.array(vertex_data['score'], dtype=np.float32)
+    
+    # Clean up intermediate ply
+    try:
+        os.remove(ply_out_path)
+    except Exception:
+        pass
+        
+    return semantic_pred, instance_pred, instance_scores, infer_time
+
+
+def save_segmented_las(template_las_header, points_dict, output_las_path):
+    """
+    Saves points to LAS/LAZ with extra dimensions:
+      - tree_id (int32): 0..K-1 for tree instances, -1 for ground
+      - tree_score (float32): instance confidence score
+      - semantic_pred (int32): 0=Ground, 1=Wood/Stem, 2=Foliage
+      - itc (int32): 1..K for tree crowns, 0 for ground
+    Updates standard ASPRS classification:
+      - 2 = Ground
+      - 4 = Medium Vegetation / Wood (Stems / Branches)
+      - 5 = High Vegetation / Foliage (Leaves)
+    """
+    os.makedirs(os.path.dirname(output_las_path), exist_ok=True)
+    
+    hdr = laspy.LasHeader(
+        point_format=template_las_header.point_format.id,
+        version=template_las_header.version
+    )
+    hdr.scales = template_las_header.scales
+    hdr.offsets = template_las_header.offsets
+    
+    hdr.add_extra_dim(laspy.ExtraBytesParams(name='tree_id', type=np.int32))
+    hdr.add_extra_dim(laspy.ExtraBytesParams(name='tree_score', type=np.float32))
+    hdr.add_extra_dim(laspy.ExtraBytesParams(name='semantic_pred', type=np.int32))
+    hdr.add_extra_dim(laspy.ExtraBytesParams(name='itc', type=np.int32))
+    
+    las = laspy.LasData(hdr)
+    
+    for dim_name in template_las_header.point_format.dimension_names:
+        if dim_name in points_dict:
+            las[dim_name] = points_dict[dim_name]
+            
+    tree_ids = points_dict['tree_id'].astype(np.int32)
+    las.tree_id = tree_ids
+    las.tree_score = points_dict['tree_score'].astype(np.float32)
+    
+    if 'itc' in points_dict:
+        las.itc = points_dict['itc'].astype(np.int32)
+    else:
+        las.itc = np.where(tree_ids >= 0, tree_ids + 1, 0).astype(np.int32)
+    
+    if 'semantic_pred' in points_dict:
+        las.semantic_pred = points_dict['semantic_pred'].astype(np.int32)
+    
+    classification = np.array(points_dict.get('classification', np.zeros(len(tree_ids), dtype=np.uint8)))
+    if 'semantic_pred' in points_dict:
+        sem = points_dict['semantic_pred']
+        classification[sem == 0] = 2  # Ground
+        classification[sem == 1] = 4  # Wood (Trunk/Branches)
+        classification[sem == 2] = 5  # Foliage (Canopy/Leaves)
+    else:
+        classification[tree_ids >= 0] = 4
+        classification[tree_ids == -1] = 2
+    las.classification = classification
+    
+    las.write(output_las_path)
+    print(f"[Output] Saved segmented LAS to: {output_las_path}")
+
+
+def save_segmented_ply(xyz, semantic_pred, instance_pred, scores, output_ply_path):
+    """Saves segmented point cloud to binary PLY format."""
+    os.makedirs(os.path.dirname(output_ply_path), exist_ok=True)
+    N = len(xyz)
+    dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+             ('semantic_pred', 'i4'), ('tree_id', 'i4'), ('tree_score', 'f4')]
+    
+    vertex = np.zeros(N, dtype=dtype)
+    vertex['x'] = np.array(xyz[:, 0], dtype=np.float32)
+    vertex['y'] = np.array(xyz[:, 1], dtype=np.float32)
+    vertex['z'] = np.array(xyz[:, 2], dtype=np.float32)
+    vertex['semantic_pred'] = np.array(semantic_pred, dtype=np.int32)
+    vertex['tree_id'] = np.array(instance_pred, dtype=np.int32)
+    vertex['tree_score'] = np.array(scores, dtype=np.float32)
+    
+    el = PlyElement.describe(vertex, 'vertex')
+    PlyData([el], text=False).write(output_ply_path)
+    print(f"[Output] Saved segmented PLY to: {output_ply_path}")
+
+
+def extract_roi_from_las(las_path, bounds):
+    """Extracts points inside bounds [xmin, ymin, xmax, ymax] efficiently in chunks."""
+    xmin, ymin, xmax, ymax = bounds
+    print(f"[Extract] Slicing ROI [{xmin:.1f}, {ymin:.1f}] to [{xmax:.1f}, {ymax:.1f}]...")
+    
+    with laspy.open(las_path) as f:
+        header = f.header
+        chunks_xyz = []
+        chunks_dims = {d: [] for d in header.point_format.dimension_names}
+        
+        chunk_size = 5_000_000
+        for chunk in f.chunk_iterator(chunk_size):
+            mask = (chunk.x >= xmin) & (chunk.x <= xmax) & (chunk.y >= ymin) & (chunk.y <= ymax)
+            if np.any(mask):
+                chunks_xyz.append(np.vstack([chunk.x[mask], chunk.y[mask], chunk.z[mask]]).T)
+                for d in header.point_format.dimension_names:
+                    chunks_dims[d].append(np.array(chunk[d][mask]))
+                    
+    if not chunks_xyz:
+        raise ValueError(f"No points found inside specified ROI bounds: {bounds}")
+        
+    full_xyz = np.vstack(chunks_xyz)
+    combined_dims = {d: np.concatenate(chunks_dims[d]) for d in header.point_format.dimension_names}
+    
+    print(f"[Extract] Extracted {full_xyz.shape[0]:,} points inside ROI.")
+    return full_xyz, combined_dims, header
+
+
+def process_single_plot(model, temp_dir, device, input_path, output_dir, roi_bounds=None, base_name="plot"):
+    """Processes a single plot or ROI crop."""
+    if roi_bounds is not None:
+        xyz, dims_dict, header = extract_roi_from_las(input_path, roi_bounds)
+    else:
+        print(f"[Input] Reading point cloud from {input_path}...")
+        las_in = laspy.read(input_path)
+        header = las_in.header
+        xyz = np.vstack([las_in.x, las_in.y, las_in.z]).T.astype(np.float64)
+        dims_dict = {d: np.array(las_in[d]) for d in header.point_format.dimension_names}
+        print(f"[Input] Loaded {xyz.shape[0]:,} points.")
+        
+    print(f"[Inference] Running ForestFormer3D...")
+    sem_pred, ins_pred, scores, dt = run_cylinder_inference(model, xyz, temp_dir, device, scan_name=base_name)
+    
+    unique_trees = np.unique(ins_pred[ins_pred >= 0])
+    num_trees = len(unique_trees)
+    print(f"[Results] Finished in {dt:.1f}s | Detected {num_trees} individual tree instances!")
+    
+    dims_dict['tree_id'] = ins_pred
+    dims_dict['tree_score'] = scores
+    dims_dict['semantic_pred'] = sem_pred
+    dims_dict['itc'] = np.where(ins_pred >= 0, ins_pred + 1, 0).astype(np.int32)
+    
+    out_las = os.path.join(output_dir, f"{base_name}_segmented.las")
+    out_ply = os.path.join(output_dir, f"{base_name}_segmented.ply")
+    
+    save_segmented_las(header, dims_dict, out_las)
+    save_segmented_ply(xyz, sem_pred, ins_pred, scores, out_ply)
+    
+    return out_las, num_trees, dt
+
+
+def merge_segmented_tiles(template_header, tile_files_list, output_las_path):
+    """
+    Streams and concatenates all segmented tile LAS files into a single master tract LAS file.
+    Uses chunked streaming to maintain minimal RAM overhead.
+    """
+    print(f"\n==================================================")
+    print(f"[Merge] Merging {len(tile_files_list)} tiles into master tract file: {output_las_path}")
+    print(f"==================================================")
+    t0 = time.time()
+    os.makedirs(os.path.dirname(output_las_path), exist_ok=True)
+    
+    hdr = laspy.LasHeader(
+        point_format=template_header.point_format.id,
+        version=template_header.version
+    )
+    hdr.scales = template_header.scales
+    hdr.offsets = template_header.offsets
+    
+    hdr.add_extra_dim(laspy.ExtraBytesParams(name='tree_id', type=np.int32))
+    hdr.add_extra_dim(laspy.ExtraBytesParams(name='tree_score', type=np.float32))
+    hdr.add_extra_dim(laspy.ExtraBytesParams(name='semantic_pred', type=np.int32))
+    hdr.add_extra_dim(laspy.ExtraBytesParams(name='itc', type=np.int32))
+    
+    total_written = 0
+    with laspy.open(output_las_path, mode='w', header=hdr) as writer:
+        for idx, tile_file in enumerate(tile_files_list, 1):
+            if not os.path.isfile(tile_file):
+                print(f"[Merge] Warning: Tile file not found: {tile_file}")
+                continue
+            with laspy.open(tile_file) as reader:
+                tile_las = reader.read()
+                writer.write_points(tile_las.points)
+                pts_count = len(tile_las.points)
+                total_written += pts_count
+                print(f"[Merge {idx}/{len(tile_files_list)}] Appended {os.path.basename(tile_file)} ({pts_count:,} pts) | Total so far: {total_written:,}")
+                
+    elapsed = time.time() - t0
+    print(f"[Merge Complete] Successfully merged {total_written:,} points in {elapsed:.1f}s!")
+    print(f"[Output] Master tract LAS saved: {output_las_path}")
+    return output_las_path
+
+
+def tile_and_process_tract(model, temp_dir, device, input_path, output_dir, tile_size=70.0, overlap=10.0):
+    """
+    High-performance, in-memory buffered grid partitioning for massive forest tracts:
+    1. Pre-loads all coordinates into RAM (fast 2s load).
+    2. Computes non-overlapping core cells of size `tile_size` x `tile_size`.
+    3. Buffers each cell by `overlap` on all 4 sides for context during cylinder sliding inference.
+    4. Slices in-memory in milliseconds.
+    5. Filters predictions back to core cell points (ensuring 0 duplicate points across tiles).
+    6. Assigns continuous global tree IDs (0..K-1, itc 1..K) across the whole tract.
+    7. Supports checkpoint resumption via JSON progress manifest.
+    8. Merges all segmented tiles into a single master tract LAS file.
+    """
+    tiles_dir = os.path.join(output_dir, "tiles")
+    os.makedirs(tiles_dir, exist_ok=True)
+    
+    progress_file = os.path.join(output_dir, "tract_tiling_progress.json")
+    if os.path.isfile(progress_file):
+        try:
+            with open(progress_file, "r") as pf:
+                progress = json.load(pf)
+        except Exception:
+            progress = {"completed_tiles": {}, "global_tree_offset": 0}
+    else:
+        progress = {"completed_tiles": {}, "global_tree_offset": 0}
+        
+    print(f"\n[Tract Processing] Loading input point cloud into memory: {input_path}...")
+    t_load = time.time()
+    las_full = laspy.read(input_path)
+    hdr = las_full.header
+    total_tract_pts = hdr.point_count
+    print(f"[Tract Processing] Loaded {total_tract_pts:,} points in {time.time() - t_load:.2f}s.")
+    
+    # Pre-extract coordinate arrays to numpy for ultra-fast spatial indexing
+    t_coords = time.time()
+    x_coords = np.array(las_full.x)
+    y_coords = np.array(las_full.y)
+    z_coords = np.array(las_full.z)
+    print(f"[Tract Processing] Cached coordinate arrays in RAM in {time.time() - t_coords:.2f}s.")
+    
+    min_x, max_x = float(x_coords.min()), float(x_coords.max())
+    min_y, max_y = float(y_coords.min()), float(y_coords.max())
+    
+    # Non-overlapping core grid
+    xs = np.arange(min_x, max_x, tile_size)
+    ys = np.arange(min_y, max_y, tile_size)
+    
+    grid_cells = []
+    tile_idx = 0
+    for i, x in enumerate(xs):
+        for j, y in enumerate(ys):
+            tile_idx += 1
+            x_core_min = float(x)
+            x_core_max = float(xs[i + 1]) if (i + 1 < len(xs)) else float(max_x + 0.001)
+            y_core_min = float(y)
+            y_core_max = float(ys[j + 1]) if (j + 1 < len(ys)) else float(max_y + 0.001)
+            
+            # Fast check if this core cell contains points
+            core_mask = (x_coords >= x_core_min) & (x_coords < x_core_max) & \
+                        (y_coords >= y_core_min) & (y_coords < y_core_max)
+            core_indices = np.flatnonzero(core_mask)
+            n_core = len(core_indices)
+            
+            if n_core > 0:
+                tile_name = f"tile_{tile_idx:03d}_x{int(x_core_min)}_y{int(y_core_min)}"
+                grid_cells.append({
+                    "tile_idx": tile_idx,
+                    "tile_name": tile_name,
+                    "core_bounds": (x_core_min, x_core_max, y_core_min, y_core_max),
+                    "core_indices": core_indices,
+                    "n_core": n_core
+                })
+                
+    total_active = len(grid_cells)
+    print(f"[Tract Grid] {total_active} active tiles contain points (out of {len(xs) * len(ys)} total grid cells).")
+    print(f"[Tract Grid] Tile size: {tile_size:.1f}m x {tile_size:.1f}m | Evaluation context buffer: +{overlap:.1f}m on each side.")
+    
+    completed_las_files = []
+    
+    for k, cell in enumerate(grid_cells, 1):
+        tile_name = cell["tile_name"]
+        x_cmin, x_cmax, y_cmin, y_cmax = cell["core_bounds"]
+        core_indices = cell["core_indices"]
+        n_core = cell["n_core"]
+        tile_las_path = os.path.join(tiles_dir, f"{tile_name}_segmented.las")
+        
+        # Checkpoint check
+        if tile_name in progress["completed_tiles"] and os.path.isfile(tile_las_path):
+            info = progress["completed_tiles"][tile_name]
+            print(f"[{k}/{total_active}] Tile '{tile_name}' already completed ({info.get('trees', 0)} trees). Skipping.")
+            completed_las_files.append(tile_las_path)
+            continue
+            
+        print(f"\n--------------------------------------------------------------------------------")
+        print(f"[{k}/{total_active}] Processing Tile {cell['tile_idx']:03d} [{tile_name}] ({n_core:,} core points)")
+        print(f"--------------------------------------------------------------------------------")
+        
+        # Buffer for sliding cylinder context
+        x_emin = x_cmin - overlap
+        x_emax = x_cmax + overlap
+        y_emin = y_cmin - overlap
+        y_emax = y_cmax + overlap
+        
+        eval_mask = (x_coords >= x_emin) & (x_coords <= x_emax) & \
+                    (y_coords >= y_emin) & (y_coords <= y_emax)
+        xyz_eval = np.vstack([x_coords[eval_mask], y_coords[eval_mask], z_coords[eval_mask]]).T.astype(np.float64)
+        print(f"[{tile_name}] Sliced {xyz_eval.shape[0]:,} eval points (including {overlap:.0f}m context buffer).")
+        
+        sem_pred, ins_pred, scores, infer_time = run_cylinder_inference(
+            model, xyz_eval, temp_dir, device, scan_name=tile_name
+        )
+        
+        # Crop predictions to core cell points
+        core_in_eval = (xyz_eval[:, 0] >= x_cmin) & (xyz_eval[:, 0] < x_cmax) & \
+                       (xyz_eval[:, 1] >= y_cmin) & (xyz_eval[:, 1] < y_cmax)
+        
+        core_sem = sem_pred[core_in_eval]
+        core_ins = ins_pred[core_in_eval]
+        core_scores = scores[core_in_eval]
+        
+        # Renumber tree IDs globally to avoid collisions across tiles
+        current_offset = progress.get("global_tree_offset", 0)
+        valid_trees = np.unique(core_ins[core_ins >= 0])
+        n_tile_trees = len(valid_trees)
+        
+        if n_tile_trees > 0:
+            idx_map = np.searchsorted(valid_trees, core_ins)
+            valid = (idx_map < len(valid_trees)) & (valid_trees[np.clip(idx_map, 0, len(valid_trees)-1)] == core_ins)
+            global_ins = np.full(core_ins.shape, -1, dtype=np.int32)
+            global_ins[valid] = idx_map[valid] + current_offset
+        else:
+            global_ins = np.full(core_ins.shape, -1, dtype=np.int32)
+            
+        global_itc = np.where(global_ins >= 0, global_ins + 1, 0).astype(np.int32)
+        
+        # Extract original dimensions for core points using precomputed indices
+        core_dims = {d: np.array(las_full[d][core_indices]) for d in hdr.point_format.dimension_names}
+        core_dims['tree_id'] = global_ins
+        core_dims['tree_score'] = core_scores
+        core_dims['semantic_pred'] = core_sem
+        core_dims['itc'] = global_itc
+        
+        save_segmented_las(hdr, core_dims, tile_las_path)
+        
+        # Update progress and checkpoint
+        progress["global_tree_offset"] = current_offset + n_tile_trees
+        progress["completed_tiles"][tile_name] = {
+            "las_file": tile_las_path,
+            "points": int(n_core),
+            "trees": int(n_tile_trees),
+            "elapsed_sec": round(infer_time, 2)
+        }
+        with open(progress_file, "w") as pf:
+            json.dump(progress, pf, indent=2)
+            
+        completed_las_files.append(tile_las_path)
+        print(f"[{tile_name}] Finished in {infer_time:.1f}s | {n_tile_trees} trees assigned (Global IDs: {current_offset}..{current_offset + n_tile_trees - 1})")
+        
+    print(f"\n==================================================")
+    print(f"[All Tiles Processed] Total Segmented Trees: {progress['global_tree_offset']}")
+    print(f"==================================================")
+    
+    # Merge all tiles into master tract file
+    base_file_name = os.path.splitext(os.path.basename(input_path))[0]
+    merged_tract_las = os.path.join(output_dir, f"{base_file_name}_entire_tract_segmented.las")
+    merge_segmented_tiles(hdr, completed_las_files, merged_tract_las)
+    
+    return merged_tract_las
+
+
+def main():
+    parser = argparse.ArgumentParser(description="ForestFormer3D Native Windows LAS Tree Segmentation Runner")
+    parser.add_argument("--input", "-i", type=str, default=r"D:\LLR DATA\20250407_LLR_L2_normalized.las",
+                        help="Path to input LAS or LAZ point cloud file")
+    parser.add_argument("--output-dir", "-o", type=str, default=r"D:\LLR DATA\ff3d_output",
+                        help="Directory to save segmented outputs")
+    parser.add_argument("--config", type=str,
+                        default=os.path.join(REPO_ROOT, "configs", "oneformer3d_qs_radius16_qp300_2many.py"),
+                        help="Path to OneFormer3D config file")
+    parser.add_argument("--checkpoint", type=str,
+                        default=os.path.join(REPO_ROOT, "work_dirs", "clean_forestformer", "epoch_3000_fix.pth"),
+                        help="Path to pretrained model checkpoint")
+    parser.add_argument("--roi", nargs=4, type=float, metavar=("XMIN", "YMIN", "XMAX", "YMAX"),
+                        help="Crop ROI bounding box [xmin ymin xmax ymax]")
+    parser.add_argument("--plot-center", nargs=2, type=float, metavar=("X", "Y"),
+                        help="Center coordinates (X Y) of plot to segment")
+    parser.add_argument("--plot-size", nargs=2, type=float, default=[60.0, 60.0], metavar=("WIDTH", "HEIGHT"),
+                        help="Width and height of the plot in meters (default: 60 60)")
+    parser.add_argument("--tile-all", action="store_true",
+                        help="Tile the entire dataset into overlapping grid tiles and run batch segmentation")
+    parser.add_argument("--tile-size", type=float, default=70.0,
+                        help="Tile size in meters for batch processing (default: 70.0)")
+    parser.add_argument("--tile-overlap", type=float, default=10.0,
+                        help="Overlap context buffer for adjacent tiles in meters (default: 10.0)")
+    parser.add_argument("--radius", type=float, default=16.0,
+                        help="Cylinder crop radius in meters (default: 16.0)")
+    parser.add_argument("--step-size", type=float, default=6.0,
+                        help="Cylinder sliding step size in meters (default: 6.0; use 4.0 for dense mode)")
+    parser.add_argument("--score-th", type=float, default=0.4,
+                        help="Confidence score threshold for tree instances (default: 0.4)")
+    parser.add_argument("--gpu", type=int, default=0,
+                        help="CUDA GPU device index (default: 0)")
+    parser.add_argument("--open-treeaibox", "--treeaibox", action="store_true",
+                        help="Automatically open segmented output in TreeAIBox Enhancer")
+    
+    args = parser.parse_args()
+    
+    if not os.path.isfile(args.input):
+        print(f"Error: Input file not found: {args.input}")
+        sys.exit(1)
+        
+    if not os.path.isfile(args.checkpoint):
+        print(f"Error: Checkpoint weights not found: {args.checkpoint}")
+        sys.exit(1)
+        
+    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+    print(f"[Device] Using computing device: {device}")
+    if torch.cuda.is_available():
+        print(f"[Device] GPU: {torch.cuda.get_device_name(args.gpu)}")
+        print(f"[Device] VRAM: {torch.cuda.get_device_properties(args.gpu).total_memory / (1024**3):.1f} GB")
+        
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Build model
+    model, temp_dir = build_pipeline_model(
+        args.config, args.checkpoint, device,
+        radius=args.radius, step_size=args.step_size, score_th=args.score_th
+    )
+    
+    base_file_name = os.path.splitext(os.path.basename(args.input))[0]
+    out_las = None
+
+    def launch_treeaibox(las_file_path):
+        batch_script = r"C:\Users\w0491597\Documents\Projects\TreeAIBox\run_treeaibox_enhancer.bat"
+        if not os.path.isfile(batch_script):
+            print(f"[TreeAIBox] Warning: Batch script not found at {batch_script}")
+            return
+        print(f"\n[TreeAIBox] Launching TreeAIBox Enhancer GUI with:\n  -> {las_file_path}")
+        import subprocess
+        subprocess.Popen([batch_script, las_file_path], shell=True)
+
+    # Case 1: Tiling whole tract
+    if args.tile_all:
+        out_las = tile_and_process_tract(
+            model, temp_dir, device, args.input, args.output_dir,
+            tile_size=args.tile_size, overlap=args.tile_overlap
+        )
+    # Case 2: Plot center specified
+    elif args.plot_center:
+        cx, cy = args.plot_center
+        w, h = args.plot_size
+        bounds = (cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0)
+        plot_name = f"{base_file_name}_center_{int(cx)}_{int(cy)}_{int(w)}x{int(h)}"
+        out_las, num_trees, dt = process_single_plot(
+            model, temp_dir, device, args.input, args.output_dir,
+            roi_bounds=bounds, base_name=plot_name
+        )
+    # Case 3: ROI bounding box specified
+    elif args.roi:
+        xmin, ymin, xmax, ymax = args.roi
+        bounds = (xmin, ymin, xmax, ymax)
+        plot_name = f"{base_file_name}_roi_{int(xmin)}_{int(ymin)}_{int(xmax)}_{int(ymax)}"
+        out_las, num_trees, dt = process_single_plot(
+            model, temp_dir, device, args.input, args.output_dir,
+            roi_bounds=bounds, base_name=plot_name
+        )
+    # Case 4: Process input file directly
+    else:
+        with laspy.open(args.input) as f:
+            n_pts = f.header.point_count
+        if n_pts > 10_000_000:
+            print(f"[Warning] Input file contains {n_pts:,} points (large tract).")
+            print(f"[Recommendation] Use --tile-all to process entire tract.")
+            print(f"[Info] Proceeding with a 60m x 60m representative plot from the tract center...")
+            with laspy.open(args.input) as f:
+                cx = (f.header.min[0] + f.header.max[0]) / 2.0
+                cy = (f.header.min[1] + f.header.max[1]) / 2.0
+            w, h = 60.0, 60.0
+            bounds = (cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0)
+            plot_name = f"{base_file_name}_center_sample_60m"
+            out_las, num_trees, dt = process_single_plot(
+                model, temp_dir, device, args.input, args.output_dir,
+                roi_bounds=bounds, base_name=plot_name
+            )
+        else:
+            out_las, num_trees, dt = process_single_plot(
+                model, temp_dir, device, args.input, args.output_dir,
+                roi_bounds=None, base_name=base_file_name
+            )
+
+    if args.open_treeaibox and out_las and os.path.isfile(out_las):
+        launch_treeaibox(out_las)
+
+
+if __name__ == "__main__":
+    main()

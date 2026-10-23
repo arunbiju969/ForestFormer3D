@@ -120,7 +120,10 @@ def main():
                                 osp.splitext(osp.basename(args.config))[0])
 
     print('Applying spconv checkpoint fix in-memory...')
-    checkpoint = torch.load(args.checkpoint, map_location='cpu')
+    try:
+        checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(args.checkpoint, map_location='cpu')
 
     key_to_fix = 'state_dict'
     if key_to_fix not in checkpoint:
@@ -132,7 +135,7 @@ def main():
         if (layer.startswith('unet') or layer.startswith('input_conv')) \
             and layer.endswith('weight') \
             and len(checkpoint_to_fix[layer].shape) == 5:
-            checkpoint_to_fix[layer] = checkpoint_to_fix[layer].permute(1, 2, 3, 4, 0)
+            checkpoint_to_fix[layer] = checkpoint_to_fix[layer].permute(4, 0, 1, 2, 3).contiguous()
     
     import tempfile
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pth') as tmp_checkpoint_file:

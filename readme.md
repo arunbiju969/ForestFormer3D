@@ -439,6 +439,33 @@ For inference, batch_size is not used, because each cylinder is processed sequen
 3. Reducing the cylinder radius, which is also configurable in the config file.
 
 ---
+
+## 🚀 Fast Engine & Tract-Scale Processing (Fork Improvements)
+
+This fork includes high-performance additions for processing large-scale airborne/UAV LiDAR datasets (e.g. hundreds of millions of points) directly on Windows and Linux:
+
+### 1. In-Memory GPU Fast Engine (`predict_fast.py`)
+- **Direct PyTorch GPU KD-tree / CUDA KNN**: Eliminates the slow CPU-bound Scikit-Learn `NearestNeighbors` step, reducing raw-to-voxel query projection latency by **>70%**.
+- **Zero Temporary PLY Overhead**: Retains coordinate grids and features directly in GPU/host RAM without reading/writing intermediate disk files per cylinder.
+- **Enhanced Accuracy & Crown Integrity**: Preserves tree canopies near cylinder borders without artificial edge-clipping artifacts.
+
+### 2. Whole-Tract Tiled Pipeline (`run_inference_fast.py`)
+- Splits massive tracts into manageable spatial tiles with spatial buffer margins.
+- Standard LAS/LAZ I/O with automatic preservation of coordinate offsets, spatial reference systems, and metadata.
+- Outputs standard schema: `semantic_pred`, `itc`, `tree_id`, `tree_score`, and ASPRS `classification` (no legacy `stemcls`).
+
+### 3. Boundary Seamline Tree Stitcher (`stitch_boundary_trees.py`)
+- Automatically detects and stitches tree crowns bisected by tile boundaries across the entire tract.
+- Employs 3D spatial KD-Tree alignment (<35 cm gap threshold) and vertical canopy checks (ΔZ < 3 m) combined with Disjoint Set Union (DSU) to unify split segments into single unique tree IDs.
+- Eliminates artificial tree doubling along grid seams while preserving genuine individual trees.
+
+### 4. Windows & Modern PyTorch Compatibility Fixes
+- **Modern PyTorch**: Fixed `torch.load` behavior for PyTorch 2.6+ (`weights_only=False` support).
+- **Spconv 2.x Compatibility**: Corrected 5D convolutional kernel tensor transposition `(4, 0, 1, 2, 3)` preventing convolution dimension errors on modern Windows wheels.
+- Cleaned untracked dependencies (`segmentator` import made optional) and removed tracked bytecode.
+
+---
+
 ## 📝 License
 ForestFormer3D is based on the OneFormer3D codebase by Danila Rukhovich (https://github.com/filaPro/oneformer3d),  
 which is licensed under the Creative Commons Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0).

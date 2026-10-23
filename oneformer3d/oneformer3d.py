@@ -701,7 +701,8 @@ class ForAINetV2OneFormer3D(Base3DDetector):
         base_name = os.path.basename(lidar_path)
         current_filename = os.path.splitext(base_name)[0]
         #if 'val' in lidar_path:
-        if 'test' in lidar_path:
+        #if 'test' in lidar_path:
+        if True:
             import numpy as np
             from sklearn.neighbors import NearestNeighbors
             from plyfile import PlyData, PlyElement
@@ -2096,7 +2097,8 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
         base_name = os.path.basename(lidar_path)
         current_filename = os.path.splitext(base_name)[0]
         #if 'val' in lidar_path:
-        if 'test' in lidar_path:
+        #if 'test' in lidar_path:
+        if True:
             import numpy as np
             from sklearn.neighbors import NearestNeighbors
             from plyfile import PlyData, PlyElement
@@ -2267,8 +2269,9 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
         #########print(f"load pc: {(t1 - t0)*1000:.0f} ms")
         #is_test = True
         #if is_test:
-        if 'test' in lidar_path:
-            step_size = self.radius/4
+        #if 'test' in lidar_path:
+        if True:
+            step_size = getattr(self, 'step_size', None) or (self.radius / 4)
             grid_size = 0.2
             num_points = 640000
             pts_semantic_gt = batch_data_samples[0].eval_ann_info['pts_semantic_mask']
