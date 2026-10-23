@@ -442,6 +442,8 @@ For inference, batch_size is not used, because each cylinder is processed sequen
 
 ## 🚀 Fast Engine & Tract-Scale Processing (Fork Improvements)
 
+> 📖 **Technical Deep-Dive**: For complete documentation on how we ported the codebase from Linux/Docker to native Windows 11 and bypassed MinkowskiEngine, see the [Windows Porting Technical Report](WINDOWS_PORTING_REPORT.md).
+
 This fork includes high-performance additions for processing large-scale airborne/UAV LiDAR datasets (e.g. hundreds of millions of points) directly on Windows and Linux:
 
 ### 1. In-Memory GPU Fast Engine (`predict_fast.py`)
